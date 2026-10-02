@@ -1,3 +1,302 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+UPSTREAM_BASE_URL = ""
+UPSTREAM_API_KEY = ""
+UPSTREAM_AUTH_HEADER = "authorization"
+PROXY_API_KEY = ""
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 4004
+UPSTREAM_TIMEOUT_SECONDS = 300
+UPSTREAM_CA_FILE = ""
+UPSTREAM_RESPONSES_PATH = ""
+
+import argparse
+import copy
+import hmac
+import http.client
+import json
+import logging
+import os
+import ssl
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, urlunsplit
+
+LOG = logging.getLogger('proxy')
+
+
+def sanitize(payload):
+    """Only remove Chat Completions include_usage from Responses payloads."""
+    result = copy.deepcopy(payload)
+    removed = 0
+    options = result.get('stream_options')
+    if isinstance(options, dict) and 'include_usage' in options:
+        del options['include_usage']
+        removed += 1
+        if not options:
+            del result['stream_options']
+    # Some intermediaries serialize this as a flattened parameter.
+    if 'stream_options.include_usage' in result:
+        del result['stream_options.include_usage']
+        removed += 1
+    return result, removed
+
+
+@dataclass
+class Config:
+    upstream: str
+    api_key: str = ''
+    auth_header: str = 'authorization'
+    local_key: str = ''
+    timeout: float = 300
+    ca_file: str = ''
+    responses_path: str = ''
+    max_body: int = 32 * 1024 * 1024
+
+    def __post_init__(self):
+        parsed = urlsplit(self.upstream)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            raise ValueError('UPSTREAM_BASE_URL must be an http(s) URL')
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError('Do not put credentials or fragments in UPSTREAM_BASE_URL')
+        if self.auth_header.lower() not in ('authorization', 'api-key'):
+            raise ValueError('UPSTREAM_AUTH_HEADER must be authorization or api-key')
+        if self.local_key and not self.api_key:
+            raise ValueError('PROXY_API_KEY requires UPSTREAM_API_KEY to avoid forwarding the local key')
+        if self.responses_path and not self.responses_path.startswith('/'):
+            raise ValueError('UPSTREAM_RESPONSES_PATH must start with /')
+
+
+def upstream_target(config, incoming):
+    base = urlsplit(config.upstream)
+    src = urlsplit(incoming)
+    path = src.path
+    if path == '/v1' or path.startswith('/v1/'):
+        path = path[3:] or '/'
+    if path == '/responses' and config.responses_path:
+        override = urlsplit(config.responses_path)
+        target_path = override.path
+        query = '&'.join(q for q in (base.query, override.query, src.query) if q)
+    else:
+        target_path = base.path.rstrip('/') + path
+        query = '&'.join(q for q in (base.query, src.query) if q)
+    return base, urlunsplit(('', '', target_path, query, ''))
+
+
+class ProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, config):
+        self.config = config
+        super().__init__(address, ProxyHandler)
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *_):
+        pass  # Never log bodies, keys, URLs, or query strings.
+
+    def local_json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.forward()
+
+    def do_POST(self):
+        self.forward()
+
+    def do_DELETE(self):
+        self.forward()
+
+    def forward(self):
+        cfg = self.server.config
+        started = time.monotonic()
+        connection = None
+        headers_sent = False
+        removed = 0
+        path = urlsplit(self.path).path
+        normalized = path[3:] if path.startswith('/v1/') else path
+        if path == '/health' and self.command == 'GET':
+            self.local_json(200, {'status': 'ok', 'version': '1.1.0', 'mode': 'sanitize-responses'})
+            return
+        if cfg.local_key and not hmac.compare_digest(
+            self.headers.get('Authorization', ''), 'Bearer ' + cfg.local_key
+        ):
+            self.close_connection = True
+            self.local_json(401, {'error': {'message': 'Invalid proxy API key'}})
+            return
+        if not (normalized in ('/models', '/responses', '/chat/completions') or normalized.startswith('/responses/')):
+            self.close_connection = True
+            self.local_json(404, {'error': {'message': 'Supported routes: /models, /responses, /responses/*, /chat/completions (optional /v1 prefix)'}})
+            return
+        if '..' in normalized or '%' in normalized or '\\' in normalized:
+            self.close_connection = True
+            self.local_json(400, {'error': {'message': 'Invalid path'}})
+            return
+        try:
+            if self.headers.get('Transfer-Encoding'):
+                self.close_connection = True
+                self.local_json(411, {'error': {'message': 'Send JSON with Content-Length, not chunked upload'}})
+                return
+            size = int(self.headers.get('Content-Length', '0'))
+            if size < 0 or size > cfg.max_body:
+                self.close_connection = True
+                self.local_json(413, {'error': {'message': 'Request body exceeds limit'}})
+                return
+            body = self.rfile.read(size)
+            if self.command == 'POST' and normalized in ('/responses', '/responses/compact'):
+                try:
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise ValueError()
+                except (ValueError, UnicodeDecodeError):
+                    self.local_json(400, {'error': {'message': 'Expected a JSON object'}})
+                    return
+                payload, removed = sanitize(payload)
+                body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            base, target = upstream_target(cfg, self.path)
+            outgoing = {}
+            for name in ('authorization', 'api-key', 'content-type', 'accept', 'openai-organization', 'openai-project', 'openai-beta', 'x-request-id'):
+                value = self.headers.get(name)
+                if value is not None:
+                    outgoing[name] = value
+            if cfg.api_key:
+                outgoing.pop('authorization', None)
+                outgoing.pop('api-key', None)
+                outgoing[cfg.auth_header.lower()] = ('Bearer ' if cfg.auth_header.lower() == 'authorization' else '') + cfg.api_key
+            outgoing['accept-encoding'] = 'identity'
+            if self.command == 'POST':
+                outgoing['content-type'] = 'application/json'
+            if base.scheme == 'https':
+                context = ssl.create_default_context(cafile=cfg.ca_file or None)
+                connection = http.client.HTTPSConnection(base.hostname, base.port, timeout=cfg.timeout, context=context)
+            else:
+                connection = http.client.HTTPConnection(base.hostname, base.port, timeout=cfg.timeout)
+            connection.request(self.command, target, body=body or None, headers=outgoing)
+            upstream = connection.getresponse()
+            self.send_response(upstream.status)
+            blocked = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length', 'server', 'date'}
+            blocked.update(v.strip().lower() for v in upstream.getheader('Connection', '').split(','))
+            for name, value in upstream.getheaders():
+                if name.lower() not in blocked:
+                    self.send_header(name, value)
+            self.send_header('X-Proxy-Sanitized-Count', str(removed))
+            self.send_header('X-Accel-Buffering', 'no')
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            headers_sent = True
+            # read1 avoids waiting to fill a large buffer; each upstream piece is flushed.
+            while True:
+                chunk = upstream.read1(65536)
+                if not chunk:
+                    break
+                self.wfile.write(('%X\r\n' % len(chunk)).encode() + chunk + b'\r\n')
+                self.wfile.flush()
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+            LOG.info('method=%s route=%s status=%s sanitized=%s duration=%.3fs', self.command, normalized.split('/')[1], upstream.status, removed, time.monotonic() - started)
+            if upstream.status == 400 and normalized.startswith('/responses'):
+                LOG.warning('If upstream still rejects include_usage, inspect LiteLLM outgoing body; sanitizing a request BEFORE LiteLLM cannot remove parameters LiteLLM injects later.')
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            LOG.error('Upstream request failed: %s', type(exc).__name__)
+            self.close_connection = True
+            if not headers_sent:
+                self.local_json(502, {'error': {'message': 'Upstream connection failed; check URL, VPN, certificate and timeout', 'type': type(exc).__name__}})
+        finally:
+            if connection:
+                connection.close()
+
+
+
+# Embedded local tests
+import http.client
+import json
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+FIRST = b'event: response.output_text.delta\ndata: {"delta":"OK"}\n\n'
+LAST = b'event: response.completed\ndata: {"response":{"usage":{"input_tokens":2}}}\n\n'
+
+class Upstream(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *_): pass
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+        self.server.received = (self.path, dict(self.headers), payload)
+        if payload.get('stream'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(FIRST + LAST)))
+            self.end_headers()
+            self.wfile.write(FIRST)
+            self.wfile.flush()
+            self.server.release.wait(3)
+            self.wfile.write(LAST)
+            self.wfile.flush()
+        else:
+            body = b'{"error":{"message":"Unknown parameter: stream_options.include_usage"}}' if payload.get('fail') else b'{"id":"resp_test","usage":{"input_tokens":2}}'
+            self.send_response(400 if payload.get('fail') else 200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('x-request-id', 'upstream-test')
+            self.end_headers()
+            self.wfile.write(body)
+    def do_GET(self):
+        self.server.received = (self.path, dict(self.headers), None)
+        body = b'{"data":[{"id":"gpt-6.1-sol"}]}'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+class ProxyTests(unittest.TestCase):
+    def setUp(self):
+        self.upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+        self.upstream.daemon_threads = True
+        self.upstream.release = threading.Event()
+        self.proxy = ProxyServer(('127.0.0.1', 0), Config('http://127.0.0.1:%s/v1' % self.upstream.server_port))
+        self.threads = []
+        for server in (self.upstream, self.proxy):
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.threads.append(thread)
+    def tearDown(self):
+        self.upstream.release.set()
+        for server in (self.proxy, self.upstream):
+            server.shutdown()
+            server.server_close()
+        for thread in self.threads: thread.join(2)
+    def request(self, payload, path='/v1/responses', key='client-key'):
+        conn = http.client.HTTPConnection('127.0.0.1', self.proxy.server_port, timeout=2)
+        conn.request('POST', path, json.dumps(payload), {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key})
+        return conn, conn.getresponse()
+    def test_sanitize_preserves_other_options(self):
+        src = {'stream_options': {'include_usage': True, 'include_obfuscation': False}, 'stream': True}
+        clean, removed = sanitize(src)
+        self.assertEqual(removed, 1)
+        self.assertEqual(clean['stream_options'], {'include_obfuscation': False})
+        self.assertIn('include_usage', src['stream_options'])
+    def test_tools_and_auth_preserved(self):
+        payload = {'model': 'gpt-6.1-sol', 'input': [{'type': 'function_call_output', 'call_id': 'call_1', 'output': '成功'}], 'tools': [{'type': 'function', 'name': 'test', 'parameters': {'type': 'object'}}], 'reasoning': {'effort': 'low'}, 'stream_options': {'include_usage': True}}
+        conn, res = self.request(payload)
+        self.assertEqual(res.status, 200)
+        self.assertEqual(res.getheader('X-Proxy-Sanitized-Count'), '1')
+        self.assertEqual(res.getheader('x-request-id'), 'upstream-test')
+        res.read(); conn.close()
+        path, headers, sent = self.upstream.received
+        self.assertEqual(path, '/v1/responses')
+        self.assertEqual(headers['authorization'], 'Bearer client-key')
         del payload['stream_options']
         self.assertEqual(sent, payload)
     def test_sse_delivered_before_upstream_finishes(self):
